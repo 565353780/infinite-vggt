@@ -4,15 +4,7 @@ sys.path.append('../camera-control')
 sys.path.append('../colmap-manage')
 sys.path.append('../vggt')
 
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# infinite_vggt/Demo/detector.py -> infinite_vggt/Demo -> infinite_vggt -> infinite-vggt
-_PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..', '..'))
-
-# 让 `from infinite_vggt.Module.detector import Detector` 能从仓库根定位包。
-if _PROJECT_ROOT not in sys.path:
-    sys.path.append(_PROJECT_ROOT)
-
-os.environ.setdefault('CUDA_VISIBLE_DEVICES', '6')
+os.environ['CUDA_VISIBLE_DEVICES'] = '6'
 
 from shutil import rmtree
 
@@ -40,7 +32,7 @@ def demo():
     total_budget = 1200000
     # 是否启用 VGGSfM + COLMAP BA。关闭时 Detector 会用 VGGT depth 反投点 +
     # 输入图像生成兜底的 ``points_ba`` / ``colors_ba``，下游点云导出仍可工作。
-    is_ba_optimize = False
+    is_ba_optimize = True
 
     detector = Detector(
         model_file_path,
@@ -54,7 +46,7 @@ def demo():
         image_folder_path,
         robust_mode,
         cos_thresh,
-        target_image_num=200,
+        target_image_num=72,
         is_ba_optimize=is_ba_optimize,
     )
 
