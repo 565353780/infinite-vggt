@@ -38,6 +38,9 @@ def demo():
     robust_mode = False
     cos_thresh = 0.95
     total_budget = 1200000
+    # 是否启用 VGGSfM + COLMAP BA。关闭时 Detector 会用 VGGT depth 反投点 +
+    # 输入图像生成兜底的 ``points_ba`` / ``colors_ba``，下游点云导出仍可工作。
+    is_ba_optimize = False
 
     detector = Detector(
         model_file_path,
@@ -52,6 +55,7 @@ def demo():
         robust_mode,
         cos_thresh,
         target_image_num=200,
+        is_ba_optimize=is_ba_optimize,
     )
 
     assert result is not None

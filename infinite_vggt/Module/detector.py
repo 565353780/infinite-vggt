@@ -64,10 +64,8 @@ if os.path.isdir(_SRC_ROOT) and _SRC_ROOT not in sys.path:
     sys.path.append(_SRC_ROOT)
 
 
-import pycolmap
-
-from camera_control.Method.data import toTensor
 from camera_control.Module.camera import Camera
+from camera_control.Module.camera_convertor import CameraConvertor
 
 from colmap_manage.Method.video import videoToImages
 
@@ -75,11 +73,8 @@ from streamvggt.models.streamvggt import StreamVGGT
 from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 from streamvggt.utils.geometry import unproject_depth_map_to_point_map
 
-from vggt.dependency.track_predict import predict_tracks
-from vggt.dependency.np_to_pycolmap import (
-    batch_np_matrix_to_pycolmap,
-    pycolmap_to_batch_np_matrix,
-)
+# 复用 vggt_detect 仓库的统一 BA 优化器，避免重复维护 VGGSfM + COLMAP BA 逻辑。
+from vggt_detect.Module.ba_optimizer import BAOptimizer
 
 
 # StreamVGGT 推理使用的固定方图分辨率（与 patch_size=14 对齐：518/14=37）
@@ -728,6 +723,7 @@ class Detector(object):
         original_coords_ba: Optional[Union[torch.Tensor, np.ndarray]] = None,
         robust_mode: bool = True,
         cos_thresh: float = 0.95,
+        is_ba_optimize: bool = False,
     ) -> Optional[Tuple[List[Camera], Dict]]:
         '''
         Args:
@@ -744,6 +740,9 @@ class Detector(object):
                     深度裁掉 padding 后再交给 Camera。
             robust_mode: 是否启用基于帧间相似度的鲁棒筛选。
             cos_thresh: 鲁棒筛选阈值。
+            is_ba_optimize: 是否启用 VGGSfM + COLMAP Bundle Adjustment 位姿优化，
+                    默认 ``False``。关闭时直接使用 StreamVGGT 输出的 extrinsic，
+                    ``ba_intrinsic`` 退回到由 VGGT intrinsic 缩放到 BA 分辨率的结果。
         '''
         if images_ba.shape[0] == 0:
             print('[WARN][Detector::detectImages]')
@@ -780,15 +779,42 @@ class Detector(object):
         if predictions is None:
             return None
 
-        # BA 在 BA 分辨率（即输入 images_ba 的尺度，默认 1024）下进行；
-        # 优化后的 1024 内参写到 predictions['ba_intrinsic']，外参写回 predictions['extrinsic']。
-        optimized_predictions = self.optimizeCameraPosesByBA(
-            predictions=predictions,
-            images=images_ba,
-        )
+        if is_ba_optimize:
+            # BA 在 BA 分辨率（即输入 images_ba 的尺度，默认 1024）下进行；
+            # 优化后的 1024 内参写到 predictions['ba_intrinsic']，外参写回 predictions['extrinsic']。
+            optimized_predictions = self.optimizeCameraPosesByBA(
+                predictions=predictions,
+                images=images_ba,
+            )
 
-        if optimized_predictions is None:
-            return None
+            if optimized_predictions is None:
+                return None
+        else:
+            # 跳过 BA 优化：直接使用 StreamVGGT 输出的 extrinsic，把 VGGT 分辨率（518）
+            # 的内参缩放到 BA 分辨率（1024）作为 ``ba_intrinsic``，与下游 Camera 创建
+            # 逻辑保持一致。
+            print('Skip Bundle Adjustment optimization (is_ba_optimize=False).')
+            ba_height = int(images_ba.shape[-2])
+            ba_width = int(images_ba.shape[-1])
+            vggt_height = int(predictions['depth_conf'].shape[-2])
+            vggt_width = int(predictions['depth_conf'].shape[-1])
+
+            ba_intrinsic = BAOptimizer._scaleIntrinsicToBA(
+                predictions['intrinsic'],
+                ba_height, ba_width, vggt_height, vggt_width,
+            )
+
+            optimized_predictions = predictions.copy()
+            optimized_predictions['ba_image_size'] = np.array(
+                [ba_height, ba_width], dtype=np.int64,
+            )
+            optimized_predictions['ba_intrinsic'] = ba_intrinsic
+
+            # ``points_ba`` / ``colors_ba`` 留到 ``camera_list`` 构建完成后，由
+            # ``CameraConvertor.createDepthPcd`` 基于裁掉 padding 的 ``Camera.depth``
+            # 与原图 ``Camera.image`` 重新生成，避免使用 518 padded 方图的
+            # ``world_points_from_depth`` / ``predictions['images']`` 与下游
+            # COLMAP 导出尺度不一致。
 
         extrinsics = optimized_predictions['extrinsic']  # (N, 3, 4) BA-optimized
         ba_intrinsics = optimized_predictions['ba_intrinsic']  # (N, 3, 3) at BA resolution
@@ -825,6 +851,23 @@ class Detector(object):
 
             camera_list.append(camera)
 
+        if not is_ba_optimize:
+            # 关闭 BA 时，``points_ba`` / ``colors_ba`` 由已构建好的 ``camera_list``
+            # 通过 ``CameraConvertor.createDepthPcd`` 生成：
+            #   - 使用每个 ``Camera`` 已裁掉 padding 的 depth + 原图分辨率 image，
+            #   - 由 camera 自身的内外参把 depth 反投到世界坐标系，
+            # 与下游 COLMAP 导出 / 点云可视化使用的相机/坐标系完全一致。
+            pcd = CameraConvertor.createDepthPcd(camera_list)
+            optimized_predictions['points_ba'] = np.asarray(
+                pcd.points, dtype=np.float32,
+            )
+            if pcd.has_colors():
+                optimized_predictions['colors_ba'] = np.asarray(
+                    pcd.colors, dtype=np.float32,
+                )
+            else:
+                optimized_predictions['colors_ba'] = None
+
         return camera_list, optimized_predictions
 
     @torch.no_grad()
@@ -833,11 +876,15 @@ class Detector(object):
         image_file_path_list: list,
         robust_mode: bool = True,
         cos_thresh: float = 0.95,
+        is_ba_optimize: bool = False,
     ) -> Optional[Tuple[List[Camera], Dict]]:
         '''
         与官方 demo_colmap.py 对齐：使用 `load_and_preprocess_images_square_with_source`
         按最长边 padding 到 BA 分辨率（默认 1024）方图，避免 crop 丢失图像信息；
         StreamVGGT 推理由 `detect` 内部从 1024 方图插值到 518 方图。
+
+        Args:
+            is_ba_optimize: 是否启用 BA 优化，默认 ``False``。
         '''
         if len(image_file_path_list) == 0:
             print('[WARN][Detector::detectImageFiles]')
@@ -862,6 +909,7 @@ class Detector(object):
             original_coords_ba=original_coords_ba,
             robust_mode=robust_mode,
             cos_thresh=cos_thresh,
+            is_ba_optimize=is_ba_optimize,
         )
 
         if result is None:
@@ -879,6 +927,7 @@ class Detector(object):
         image_folder_path: str,
         robust_mode: bool = True,
         cos_thresh: float = 0.95,
+        is_ba_optimize: bool = False,
     ) -> Optional[Tuple[List[Camera], Dict]]:
         if not os.path.exists(image_folder_path):
             print('[ERROR][Detector::detectImageFolder]')
@@ -899,6 +948,7 @@ class Detector(object):
             image_file_path_list,
             robust_mode,
             cos_thresh,
+            is_ba_optimize=is_ba_optimize,
         )
 
     @torch.no_grad()
@@ -909,6 +959,7 @@ class Detector(object):
         robust_mode: bool = False,
         cos_thresh: float = 0.95,
         target_image_num: int = 200,
+        is_ba_optimize: bool = False,
     ) -> Optional[Tuple[List[Camera], Dict]]:
         '''视频入口：抽 200 帧并按 InfiniteVGGT 视频流程推理 + BA。
 
@@ -954,6 +1005,7 @@ class Detector(object):
             save_image_folder_path,
             robust_mode=robust_mode,
             cos_thresh=cos_thresh,
+            is_ba_optimize=is_ba_optimize,
         )
 
     @torch.no_grad()
@@ -969,134 +1021,19 @@ class Detector(object):
         query_frame_num: int = 8,
         fine_tracking: bool = True,
     ) -> Optional[Dict]:
-        """
-        使用 Bundle Adjustment 优化相机位姿。
-        与官方 demo_colmap 对齐：
-            - StreamVGGT 推理在 518 方图，predictions 中 depth/depth_conf/intrinsic/images/
-              world_points_from_depth 全部对应 518 尺度，本函数不再覆盖这些字段。
-            - BA 在 BA 输入分辨率（默认 1024）上做：图像保持 1024，内参从 518 缩放到 1024。
-            - BA 优化后的外参写回到 predictions['extrinsic']；额外写入：
-                * predictions['ba_intrinsic']: (N, 3, 3) BA 优化后的 1024 尺度内参，
-                  供下游 `Camera.fromVGGTPose` 直接使用。BA 失败时退回到未优化的
-                  scale 后内参。
-                * predictions['ba_image_size']: (2,) int64，BA 分辨率 (H_ba, W_ba)。
-                * predictions['points_ba'] / predictions['colors_ba']: BA 重建出的 3D 点。
-        """
-        if self.vggsfm_model_file_path is None:
-            print('[ERROR][Detector::optimizeCameraPosesByBA]')
-            print('\t please set vggsfm model file first!')
-            return None
-
-        if images.shape[0] == 0:
-            print('[ERROR][Detector::optimizeCameraPosesByBA]')
-            print('\t images are empty!')
-            return None
-
-        print("Starting Bundle Adjustment optimization...")
-
-        extrinsic = predictions['extrinsic']  # (N, 3, 4)
-        intrinsic = predictions['intrinsic']  # (N, 3, 3) at vggt_resolution (518)
-        depth_conf = predictions['depth_conf']  # (N, H_vggt, W_vggt) at 518
-        points_3d = predictions['world_points_from_depth']  # (N, H_vggt, W_vggt, 3) at 518
-
-        ba_height, ba_width = int(images.shape[-2]), int(images.shape[-1])
-        vggt_height, vggt_width = int(depth_conf.shape[-2]), int(depth_conf.shape[-1])
-
-        scale_w = ba_width / float(vggt_width)
-        scale_h = ba_height / float(vggt_height)
-        if abs(scale_w - scale_h) > 1e-6:
-            print(f"[WARN][Detector::optimizeCameraPosesByBA] non-square BA scale "
-                  f"(scale_w={scale_w}, scale_h={scale_h}); using anisotropic intrinsic scaling.")
-
-        ba_intrinsic = intrinsic.astype(np.float32, copy=True)
-        ba_intrinsic[:, 0, :] *= scale_w  # fx, cx
-        ba_intrinsic[:, 1, :] *= scale_h  # fy, cy
-
-        image_size = np.array([ba_height, ba_width])
-
-        use_cuda = torch.cuda.is_available() and str(self.device).startswith('cuda')
-        if use_cuda:
-            dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-        else:
-            dtype = torch.float32
-
-        images_gpu = toTensor(images, dtype=torch.float32, device=self.device)
-        try:
-            print("Predicting tracks for Bundle Adjustment...")
-            if use_cuda:
-                with torch.cuda.amp.autocast(dtype=dtype):
-                    pred_tracks, pred_vis_scores, pred_confs, points_3d_track, points_rgb = predict_tracks(
-                        self.vggsfm_model_file_path,
-                        images_gpu,
-                        conf=depth_conf,
-                        points_3d=points_3d,
-                        masks=None,
-                        max_query_pts=max_query_pts,
-                        query_frame_num=query_frame_num,
-                        keypoint_extractor="aliked+sp",
-                        fine_tracking=fine_tracking,
-                    )
-            else:
-                pred_tracks, pred_vis_scores, pred_confs, points_3d_track, points_rgb = predict_tracks(
-                    self.vggsfm_model_file_path,
-                    images_gpu,
-                    conf=depth_conf,
-                    points_3d=points_3d,
-                    masks=None,
-                    max_query_pts=max_query_pts,
-                    query_frame_num=query_frame_num,
-                    keypoint_extractor="aliked+sp",
-                    fine_tracking=fine_tracking,
-                )
-        finally:
-            del images_gpu
-            self._safeEmptyCudaCache()
-
-        track_mask = pred_vis_scores > vis_thresh
-
-        print("Building COLMAP reconstruction...")
-        reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
-            points_3d_track,
-            extrinsic,
-            ba_intrinsic,
-            pred_tracks,
-            image_size,
-            masks=track_mask,
+        '''薄封装：委托给共享的 ``BAOptimizer``，保持外部签名与字段契约不变。'''
+        ba_optimizer = BAOptimizer(
+            vggsfm_model_file_path=self.vggsfm_model_file_path,
+            device=self.device,
+        )
+        return ba_optimizer.optimize(
+            predictions=predictions,
+            images=images,
             max_reproj_error=max_reproj_error,
             shared_camera=shared_camera,
             camera_type=camera_type,
-            points_rgb=points_rgb,
+            vis_thresh=vis_thresh,
+            max_query_pts=max_query_pts,
+            query_frame_num=query_frame_num,
+            fine_tracking=fine_tracking,
         )
-
-        # 不修改 predictions 中已有的 518 尺度字段；只附加 BA 相关字段。
-        optimized_predictions = predictions.copy()
-        optimized_predictions['ba_image_size'] = np.array([ba_height, ba_width], dtype=np.int64)
-
-        if reconstruction is None:
-            print('[ERROR][Detector::optimizeCameraPosesByBA]')
-            print('\t No reconstruction can be built with BA, returning predictions without BA optimization')
-            optimized_predictions['ba_intrinsic'] = ba_intrinsic
-            return optimized_predictions
-
-        print("Running Bundle Adjustment...")
-        ba_options = pycolmap.BundleAdjustmentOptions()
-        pycolmap.bundle_adjustment(reconstruction, ba_options)
-
-        print("Extracting optimized poses from reconstruction...")
-        _, optimized_extrinsic_44, optimized_intrinsic, _ = pycolmap_to_batch_np_matrix(
-            reconstruction, device="cpu", camera_type=camera_type,
-        )
-
-        if optimized_extrinsic_44.shape[-1] == 4 and optimized_extrinsic_44.shape[-2] == 4:
-            optimized_extrinsic = optimized_extrinsic_44[:, :3, :]  # (N, 3, 4)
-        else:
-            optimized_extrinsic = optimized_extrinsic_44
-
-        optimized_predictions['extrinsic'] = optimized_extrinsic.astype(np.float32, copy=False)
-        optimized_predictions['ba_intrinsic'] = optimized_intrinsic.astype(np.float32, copy=False)
-
-        optimized_predictions['points_ba'] = points_3d_track
-        optimized_predictions['colors_ba'] = points_rgb
-
-        print("Bundle Adjustment optimization completed successfully!")
-        return optimized_predictions
